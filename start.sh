@@ -1,36 +1,35 @@
-#!/bin/bash
+name: Sync to Hugging Face Hub
+on:
+  push:
+    branches: [automation-engine]
+  workflow_dispatch:
 
-APP_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-mkdir -p "$APP_DIR/backend/users"
-mkdir -p /data/users
+      - name: Purge Binaries & Flatten History
+        run: |
+          # 1. Strip out the conflicting branding images
+          rm -f public/icons/icon-512x512.png
+          rm -f src/app/android-chrome-512x512.png
+          rm -f public/android-chrome-512x512.png 2>/dev/null || true
 
-if [ -f "/data/master.db" ]; then
-    cp /data/master.db "$APP_DIR/backend/master.db"
-fi
+          # 2. Wipe the local git tracking history in the worker
+          rm -rf .git
 
-if [ "$(ls -A /data/users 2>/dev/null)" ]; then
-    cp -r /data/users/* "$APP_DIR/backend/users/" 2>/dev/null
-fi
+          # 3. Re-initialize as a completely flat, clean commit
+          git init
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git checkout -b main
+          git add .
+          git commit -m "Clean automation engine deployment"
 
-(
-    while true; do
-        sleep 30
-        if [ -f "$APP_DIR/backend/master.db" ]; then
-            cp "$APP_DIR/backend/master.db" /data/master.db
-        fi
-        if [ "$(ls -A "$APP_DIR/backend/users" 2>/dev/null)" ]; then
-            cp -r "$APP_DIR/backend/users/"* /data/users/ 2>/dev/null
-        fi
-    done
-) &
-
-echo "Starting Backend Engine..."
-cd "$APP_DIR/backend"
-PORT=3001 bun start &
-
-sleep 5
-
-echo "Starting Frontend Interface..."
-cd "$APP_DIR"
-PORT=7860 BACKEND_URL=http://127.0.0.1:3001 BACKEND_DISABLED=false bun start
+      - name: Push to hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git push --force https://Avk44:$HF_TOKEN@huggingface.co/spaces/Avk44/torbox-manager HEAD:refs/heads/main
