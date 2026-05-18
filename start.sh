@@ -10,26 +10,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Purge Binaries & Flatten History
+      - name: Nuclear Purge of Binaries & Reset History
         run: |
-          # 1. Strip out the conflicting branding images
-          rm -f public/icons/icon-512x512.png
-          rm -f src/app/android-chrome-512x512.png
-          rm -f public/android-chrome-512x512.png 2>/dev/null || true
+          # 1. Find and completely destroy ALL image/binary assets across all folders
+          find . -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.ico" -o -name "*.gif" -o -name "*.svg" \) -print -delete
 
-          # 2. Wipe the local git tracking history in the worker
+          # 2. Wipe out the git tracking history completely to clear the cache
           rm -rf .git
 
-          # 3. Re-initialize as a completely flat, clean commit
+          # 3. Re-initialize a 100% clean, text-only repository tracking state
           git init
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git checkout -b main
           git add .
-          git commit -m "Clean automation engine deployment"
+          git commit -m "Pure text automation deployment package"
 
       - name: Push to hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git push --force https://Avk44:$HF_TOKEN@huggingface.co/spaces/Avk44/torbox-manager HEAD:refs/heads/main
+          git push --force https://Avk44:$HF_TOKEN@huggingface.co/spaces/Avk44/torbox-manager main:main
