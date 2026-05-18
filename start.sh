@@ -1,33 +1,36 @@
-name: Sync to Hugging Face Hub
-on:
-  push:
-    branches: [automation-engine]
-  workflow_dispatch:
+#!/bin/bash
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+APP_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-      - name: Nuclear Purge of Binaries & Reset History
-        run: |
-          # 1. Find and completely destroy ALL image/binary assets across all folders
-          find . -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.ico" -o -name "*.gif" -o -name "*.svg" \) -print -delete
+mkdir -p "$APP_DIR/backend/users"
+mkdir -p /data/users
 
-          # 2. Wipe out the git tracking history completely to clear the cache
-          rm -rf .git
+if [ -f "/data/master.db" ]; then
+    cp /data/master.db "$APP_DIR/backend/master.db"
+fi
 
-          # 3. Re-initialize a 100% clean, text-only repository tracking state
-          git init
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git checkout -b main
-          git add .
-          git commit -m "Pure text automation deployment package"
+if [ "$(ls -A /data/users 2>/dev/null)" ]; then
+    cp -r /data/users/* "$APP_DIR/backend/users/" 2>/dev/null
+fi
 
-      - name: Push to hub
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          git push --force https://Avk44:$HF_TOKEN@huggingface.co/spaces/Avk44/torbox-manager main:main
+(
+    while true; do
+        sleep 30
+        if [ -f "$APP_DIR/backend/master.db" ]; then
+            cp "$APP_DIR/backend/master.db" /data/master.db
+        fi
+        if [ "$(ls -A "$APP_DIR/backend/users" 2>/dev/null)" ]; then
+            cp -r "$APP_DIR/backend/users/"* /data/users/ 2>/dev/null
+        fi
+    done
+) &
+
+echo "Starting Backend Engine..."
+cd "$APP_DIR/backend"
+PORT=3001 bun start &
+
+sleep 5
+
+echo "Starting Frontend Interface..."
+cd "$APP_DIR"
+PORT=7860 BACKEND_URL=http://127.0.0.1:3001 BACKEND_DISABLED=false bun start
