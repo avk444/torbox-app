@@ -15,33 +15,36 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Heavy Compilation on GitHub Servers
+      - name: Clean Slate Build
         run: |
+          rm -rf .next node_modules backend/node_modules
           bun install
           bun run build
 
-      - name: Nuclear Purge of Binaries & Build Cache
+      - name: Surgical Purge of Offending Assets Only
         run: |
-          # 1. Force the git tracker to include the compiled build folder
+          # 1. Force Git to track the compiled production directory
           sed -i '/\.next/d' .gitignore || true
 
-          # 2. Drop the internal compiler cache completely (fixes the >10MB limit error)
+          # 2. Delete the hidden webpack compilation cache (>10MB files)
           rm -rf .next/cache
 
-          # 3. Delete ALL image assets causing Hugging Face's security push blocks
-          find . -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.ico" -o -name "*.gif" -o -name "*.svg" \) -delete
+          # 3. Delete ONLY the specific oversized app icons Hugging Face rejected
+          rm -f public/icons/icon-512x512.png
+          rm -f src/app/android-chrome-512x512.png
+          rm -f public/android-chrome-512x512.png 2>/dev/null || true
 
-          # 4. Clean local scratchpads before shipping
+          # 4. Clean up local project workspace nodes before shipping
           rm -rf node_modules backend/node_modules
 
-          # 5. Flat pack everything into a fresh commit state
+          # 5. Package the repository into a clean, flat transfer commit
           rm -rf .git
           git init
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git checkout -b main
           git add .
-          git commit -m "Pre-compiled package without cache assets"
+          git commit -m "Surgical production build deployment"
 
       - name: Push to hub
         env:
