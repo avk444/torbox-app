@@ -21,6 +21,13 @@ export const EXTERNAL_TORBOX_RATE_LIMIT_DEFERRAL_MESSAGE = RATE_LIMIT_DEFERRAL_M
 /** TorBox unreachable — shared queue cool-down. */
 export const CONNECTION_DEFERRAL_MESSAGE = 'TorBox API unavailable. Will retry automatically.';
 
+/**
+ * Single-upload cool-down after a create timeout / brief connection error.
+ * Not a type-wide pause — siblings keep processing.
+ */
+export const CONNECTION_SOFT_DEFERRAL_MESSAGE =
+  'TorBox create timed out or failed to connect. Will retry shortly.';
+
 /** Sibling pause while TorBox finishes a transient queued response. */
 export const TRANSIENT_TORBOX_DEFERRAL_MESSAGE =
   'TorBox is still processing a queued upload. Will retry automatically.';
@@ -34,6 +41,7 @@ export const RATE_LIMIT_DEFERRAL_MESSAGES = [
 export const TRANSIENT_DEFERRAL_MESSAGES = [
   ...RATE_LIMIT_DEFERRAL_MESSAGES,
   CONNECTION_DEFERRAL_MESSAGE,
+  CONNECTION_SOFT_DEFERRAL_MESSAGE,
   TRANSIENT_TORBOX_DEFERRAL_MESSAGE,
 ];
 
@@ -232,6 +240,28 @@ export function formatCreateQuotaWindowForApi(usage) {
 }
 
 /**
+ * When TorBox headers/queue say the uncached gate is blocked, clamp displayed window usage
+ * to the limit so the UI does not claim spare slots (durable counts can lag timeouts).
+ * @param {{ uncachedUsed?: number, uncachedLimit?: number, uncachedResetAt?: string|null }|null|undefined} window
+ * @param {{ remaining?: number|null, deferredCount?: number }} gate
+ */
+export function alignCreateQuotaWindowForBlockedGate(window, gate = {}) {
+  if (window == null || typeof window !== 'object') {
+    return window;
+  }
+  const blocked = gate.remaining === 0 || (gate.deferredCount ?? 0) > 0;
+  if (!blocked) {
+    return window;
+  }
+  const limit = window.uncachedLimit ?? TORBOX_UNCACHED_CREATE_LIMIT;
+  const used = window.uncachedUsed ?? 0;
+  if (used >= limit) {
+    return window;
+  }
+  return { ...window, uncachedUsed: limit };
+}
+
+/**
  * Keep queued upload deferrals aligned with uncached TorBox rate-limit state.
  * @param {Object} userDb
  * @param {string} type
@@ -328,19 +358,22 @@ function getQueuePauseStatistics(userDb, type) {
     return { pausedCount: 0, pausedUntil: null, pauseReason: null };
   }
 
-  const queuedRow = userDb.db
+  const pausedRow = userDb.db
     .prepare(
       `
       SELECT COUNT(*) AS paused_count
       FROM uploads
       WHERE status = 'queued'
         AND type = ?
+        AND next_attempt_at IS NOT NULL
+        AND datetime(next_attempt_at) > datetime('now')
+        AND error_message IN (${QUEUE_PAUSE_MSG_PLACEHOLDERS})
     `
     )
-    .get(type);
+    .get(type, ...queuePauseMessageBindParams());
 
   return {
-    pausedCount: queuedRow?.paused_count ?? 0,
+    pausedCount: pausedRow?.paused_count ?? 0,
     pausedUntil: anchor.paused_until,
     pauseReason: pauseReasonFromDeferralMessage(anchor.error_message),
   };
