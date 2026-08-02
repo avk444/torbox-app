@@ -412,19 +412,24 @@ export function triggerBrowserDownload(url, filename) {
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+/** AIOStreams Cache & Play / uncached resolve can run this long before redirecting. */
+const SILENT_ADD_TIMEOUT_MS = 90_000;
+
 /**
  * Hit an http(s) Stremio stream URL without opening a tab or triggering a download.
  *
- * TorBox-oriented addons add the video on the first GET, then 302/303 to a CDN
- * download link. We must:
- * - Use a **browser** request (server-side fetch often gets 403 from bot/TLS filters)
- * - Not follow the CDN hop (`redirect: 'follow'` previously buffered tens of MB)
+ * TorBox-oriented addons (notably AIOStreams `/api/v1/debrid/playback/...`) add the
+ * video during the request, then 302/307 to a CDN or a static "downloading" clip.
  *
- * `mode: 'cors'` + `redirect: 'manual'` stops before the CDN. Spec-compliant engines
- * resolve with `opaqueredirect` (status 0). Chromium in a page context often **rejects**
- * with `TypeError: Failed to fetch` instead — while DevTools still shows the 302 and
- * the CDN was never requested. That rejection means the addon hop completed, so we
- * treat it as success.
+ * Uses browser `fetch` + `redirect: 'manual'`:
+ * - Allowed by production CSP `connect-src` (hidden iframes are blocked: `default-src 'self'`
+ *   with no `frame-src`, so iframe navigations never leave the origin)
+ * - Does not follow the CDN hop (avoids multi‑MB bodies from `redirect: 'follow'`)
+ * - Waits long enough for AIOStreams debrid resolve (uncached titles need many seconds)
+ *
+ * Chromium in a page context often rejects `redirect: 'manual'` with
+ * `TypeError: Failed to fetch` after a cross-origin 302 — DevTools still shows the
+ * 302 and the CDN was not followed. That means the addon hop completed → success.
  *
  * @param {string} url
  * @returns {Promise<true>}
@@ -436,7 +441,7 @@ export async function triggerSilentStreamAdd(url) {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 3_000);
+  const timeoutId = setTimeout(() => controller.abort(), SILENT_ADD_TIMEOUT_MS);
 
   try {
     const response = await fetch(trimmed, {
@@ -469,12 +474,10 @@ export async function triggerSilentStreamAdd(url) {
     );
   } catch (error) {
     if (error?.name === 'AbortError') {
-      // Slow first hop — request was sent (add may have run); stop any body read.
-      return true;
+      throw new Error('Silent add timed out waiting for the addon to resolve');
     }
     // Chromium page context: redirect:manual + cross-origin 302 → TypeError
-    // ("Failed to fetch") even though the addon add hop completed. See caller DevTools:
-    // status 302, no CDN follow.
+    // ("Failed to fetch") even though the addon add hop completed.
     if (error instanceof TypeError) {
       return true;
     }

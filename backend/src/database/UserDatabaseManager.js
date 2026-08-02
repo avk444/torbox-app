@@ -509,10 +509,28 @@ class UserDatabaseManager {
     // Mutex map to prevent race conditions when creating connections for the same user
     this.connectionLocks = new Map(); // Map<authId, Promise>
 
+    // Durable pin counts survive pool delete/recreate. closeConnection and LRU use these
+    // so counter sync cannot close a handle mid upload-drain / poll after a reconnect.
+    this.pinCounts = new Map(); // Map<authId, number>
+
     // Semaphore to prevent pool exhaustion: limits concurrent connection acquisitions.
     // Set to maxConnections - 1 to reserve one slot for the eviction mechanism.
     const poolLimit = Math.max(1, this.pool.maxSize - 1);
     this.connectionSemaphore = new Semaphore(poolLimit);
+  }
+
+  /**
+   * Apply any pending on-disk migrations for a pooled (or freshly opened) connection.
+   * Always delegates to MigrationRunner so new versions are picked up without a
+   * hardcoded table/version list — cheap no-op when schema_migrations is current.
+   * @param {Object} connection
+   * @returns {Promise<Object>}
+   * @private
+   */
+  async _ensureConnectionMigrations(connection) {
+    if (!connection?.migrationRunner) return connection;
+    await connection.migrationRunner.runMigrations();
+    return connection;
   }
 
   /**
@@ -527,12 +545,43 @@ class UserDatabaseManager {
   }
 
   /**
+   * Copy durable pinCounts onto the pooled entry (LRU eviction / closeConnection guards).
+   * @param {string} authId
+   * @private
+   */
+  _syncPoolActiveFromPins(authId) {
+    const entry = this.pool?.cache.get(authId);
+    if (entry) {
+      entry.activeOperations = this.pinCounts.get(authId) || 0;
+    }
+  }
+
+  /**
+   * Finalize a successful get: optionally pin, always restore pin state onto the pool entry.
+   * Pinning is synchronous with validation so counter-sync closeConnection cannot race.
+   * @param {string} authId
+   * @param {Object} connection
+   * @param {boolean} pin
+   * @returns {Object}
+   * @private
+   */
+  _finalizeGetUserDatabase(authId, connection, pin) {
+    if (pin) {
+      this.pinCounts.set(authId, (this.pinCounts.get(authId) || 0) + 1);
+    }
+    this._syncPoolActiveFromPins(authId);
+    return connection;
+  }
+
+  /**
    * Get or create a user database connection
    * Uses mutex to prevent race conditions when multiple operations request the same user's connection
    * @param {string} authId - User authentication ID (API key hash)
+   * @param {{ pin?: boolean }} [options] - When pin=true, increments durable pin count before return
+   *   (prevents closeConnection / LRU eviction until matching markInactive)
    * @returns {Promise<Object>} - Database connection and migration runner
    */
-  async getUserDatabase(authId) {
+  async getUserDatabase(authId, { pin = false } = {}) {
     if (!authId) {
       throw new Error('authId is required');
     }
@@ -547,7 +596,8 @@ class UserDatabaseManager {
       try {
         cached.db.prepare('SELECT 1').get();
         // Connection is valid - refCount was incremented by get()
-        return cached;
+        await this._ensureConnectionMigrations(cached);
+        return this._finalizeGetUserDatabase(authId, cached, pin);
       } catch (error) {
         if (isClosedDatabaseError(error)) {
           logger.warn('Cached database connection is stale, removing from pool', {
@@ -560,7 +610,8 @@ class UserDatabaseManager {
             authId,
             error: error.message,
           });
-          return cached;
+          await this._ensureConnectionMigrations(cached);
+          return this._finalizeGetUserDatabase(authId, cached, pin);
         }
       }
     }
@@ -577,7 +628,8 @@ class UserDatabaseManager {
       try {
         const result = await connectionPromise;
         this.connectionSemaphore.release();
-        return result;
+        await this._ensureConnectionMigrations(result);
+        return this._finalizeGetUserDatabase(authId, result, pin);
       } catch (error) {
         // If the existing creation failed, we'll try again below
         this.connectionLocks.delete(authId);
@@ -590,7 +642,8 @@ class UserDatabaseManager {
 
     try {
       const connection = await connectionPromise;
-      return connection;
+      await this._ensureConnectionMigrations(connection);
+      return this._finalizeGetUserDatabase(authId, connection, pin);
     } finally {
       // Remove lock after connection is created (or fails)
       this.connectionLocks.delete(authId);
@@ -1005,13 +1058,16 @@ class UserDatabaseManager {
   }
 
   /**
-   * Mark a connection as having an active operation (prevents pool eviction during poll/ops).
+   * Mark a connection as having an active operation (prevents pool eviction / close during poll/ops).
+   * Pin count is durable across pool delete + reconnect.
    * @param {string} authId - User authentication ID
    */
   markActive(authId) {
-    if (authId && this.pool) {
-      this.pool.markActive(authId);
+    if (!authId || !this.pool) {
+      return;
     }
+    this.pinCounts.set(authId, (this.pinCounts.get(authId) || 0) + 1);
+    this._syncPoolActiveFromPins(authId);
   }
 
   /**
@@ -1019,9 +1075,16 @@ class UserDatabaseManager {
    * @param {string} authId - User authentication ID
    */
   markInactive(authId) {
-    if (authId && this.pool) {
-      this.pool.markInactive(authId);
+    if (!authId || !this.pool) {
+      return;
     }
+    const n = this.pinCounts.get(authId) || 0;
+    if (n <= 1) {
+      this.pinCounts.delete(authId);
+    } else {
+      this.pinCounts.set(authId, n - 1);
+    }
+    this._syncPoolActiveFromPins(authId);
   }
 
   /**
@@ -1043,12 +1106,30 @@ class UserDatabaseManager {
    * (e.g. after a poll cycle or full-sync user check). The next request for this user
    * will open a new connection. Use this in polling and batch sync to avoid holding
    * hundreds of idle connections; use releaseConnection for short request/response flows.
+   *
+   * Skips force-close when `activeOperations > 0` (e.g. upload drain / poll in flight)
+   * so batch jobs like counter sync cannot close a handle still owned by another worker.
+   *
    * @param {string} authId - User authentication ID
+   * @returns {boolean} true if the connection was closed/removed (or already absent), false if skipped
    */
   closeConnection(authId) {
-    if (authId && this.pool) {
-      this.pool.delete(authId);
+    if (!authId || !this.pool) {
+      return false;
     }
+    const pinCount = this.pinCounts.get(authId) || 0;
+    const entry = this.pool.cache.get(authId);
+    const activeOperations = entry?.activeOperations || 0;
+    if (pinCount > 0 || activeOperations > 0) {
+      logger.debug('Skipping closeConnection while user DB has active operations', {
+        authId,
+        pinCount,
+        activeOperations,
+      });
+      return false;
+    }
+    this.pool.delete(authId);
+    return true;
   }
 
   /**
