@@ -45,13 +45,13 @@ describe('user DB migration ensure on getUserDatabase', () => {
     expect(body.addons).toEqual([]);
   });
 
-  test('pooled connection applies any pending migrations before serving routes', async () => {
-    // Simulate a long-lived pool entry opened before migrations 024/025 existed:
-    // markers and tables are gone, but the handle stays pooled.
+  test('pooled connection applies pending migrations when schemaVersion is behind', async () => {
+    // Simulate a long-lived pool entry opened before migrations 024/025 existed.
     const userDb = await env.userDatabaseManager.getUserDatabase(env.authId);
     userDb.db.prepare('DELETE FROM schema_migrations WHERE version IN (?, ?)').run('024', '025');
     userDb.db.prepare('DROP TABLE IF EXISTS stremio_addons').run();
     userDb.db.prepare('DROP TABLE IF EXISTS tmdb_credentials').run();
+    userDb.schemaVersion = 23;
     env.userDatabaseManager.releaseConnection(env.authId);
 
     expect(

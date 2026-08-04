@@ -25,6 +25,8 @@ class DatabasePool {
       evictions: 0,
       lastEvictionAt: null,
       lastWarningAt: null,
+      lastExhaustionLogAt: null,
+      suppressedExhaustionLogs: 0,
       proactiveEvictions: 0,
     };
 
@@ -44,6 +46,31 @@ class DatabasePool {
       options.idleTimeoutMs ??
       parseInt(process.env.DB_POOL_IDLE_TIMEOUT_MS || String(defaultIdleTimeoutMs), 10);
     this.recentAccessWindowMs = 30 * 1000; // 30 seconds - don't evict connections accessed in this window
+  }
+
+  /**
+   * Log pool exhaustion at most once per minute; count suppressed repeats to cut log spam.
+   * @param {string} message
+   * @param {Object} meta
+   * @private
+   */
+  _logExhaustionThrottled(message, meta = {}) {
+    const EXHAUSTION_THROTTLE_MS = 60000;
+    const now = Date.now();
+    const lastAt = this.metrics.lastExhaustionLogAt
+      ? new Date(this.metrics.lastExhaustionLogAt).getTime()
+      : 0;
+    if (now - lastAt < EXHAUSTION_THROTTLE_MS) {
+      this.metrics.suppressedExhaustionLogs = (this.metrics.suppressedExhaustionLogs || 0) + 1;
+      return;
+    }
+    const suppressed = this.metrics.suppressedExhaustionLogs || 0;
+    this.metrics.lastExhaustionLogAt = new Date().toISOString();
+    this.metrics.suppressedExhaustionLogs = 0;
+    logger.error(message, {
+      ...meta,
+      ...(suppressed > 0 ? { suppressedSinceLastLog: suppressed } : {}),
+    });
   }
 
   /**
@@ -140,13 +167,16 @@ class DatabasePool {
       // The caller (UserDatabaseManager) uses a semaphore to prevent this,
       // but we guard here as a safety net.
       if (this.cache.size >= this.maxSize) {
-        logger.error('Database pool exhausted: all connections are active, cannot evict', {
-          poolSize: this.cache.size,
-          maxSize: this.maxSize,
-          activeOperations: Array.from(this.cache.entries()).filter(
-            ([_, e]) => e.activeOperations > 0
-          ).length,
-        });
+        this._logExhaustionThrottled(
+          'Database pool exhausted: all connections are active, cannot evict',
+          {
+            poolSize: this.cache.size,
+            maxSize: this.maxSize,
+            activeOperations: Array.from(this.cache.entries()).filter(
+              ([_, e]) => e.activeOperations > 0
+            ).length,
+          }
+        );
         throw new Error(`Database pool exhausted (${this.cache.size}/${this.maxSize})`);
       }
 
@@ -266,7 +296,7 @@ class DatabasePool {
         }
       }
       if (!lruKey) {
-        logger.error(
+        this._logExhaustionThrottled(
           'Database pool at capacity: no evictable connection (all entries have active operations)',
           {
             poolSize: this.cache.size,
@@ -484,6 +514,9 @@ class DatabasePool {
       evictions: 0,
       lastEvictionAt: null,
       lastWarningAt: null,
+      lastExhaustionLogAt: null,
+      suppressedExhaustionLogs: 0,
+      proactiveEvictions: 0,
     };
   }
 }
@@ -517,19 +550,53 @@ class UserDatabaseManager {
     // Set to maxConnections - 1 to reserve one slot for the eviction mechanism.
     const poolLimit = Math.max(1, this.pool.maxSize - 1);
     this.connectionSemaphore = new Semaphore(poolLimit);
+
+    // Cached max user-migration version on disk (process lifetime; files only change on restart).
+    this._latestUserMigrationVersion = null;
   }
 
   /**
-   * Apply any pending on-disk migrations for a pooled (or freshly opened) connection.
-   * Always delegates to MigrationRunner so new versions are picked up without a
-   * hardcoded table/version list — cheap no-op when schema_migrations is current.
+   * Highest user-migration version shipped in this process.
+   * @returns {Promise<number>}
+   */
+  async getLatestUserMigrationVersion() {
+    if (this._latestUserMigrationVersion != null) {
+      return this._latestUserMigrationVersion;
+    }
+    this._latestUserMigrationVersion =
+      await MigrationRunner.getLatestMigrationVersionNumber('user');
+    return this._latestUserMigrationVersion;
+  }
+
+  /**
+   * Apply pending migrations when this pooled connection may be behind on-disk versions.
+   * Cheap no-op when schemaVersion is current. Coalesces concurrent callers on the same handle.
+   * One-time schema heals belong in a new migration (e.g. 026), not per-request table checks.
    * @param {Object} connection
    * @returns {Promise<Object>}
    * @private
    */
   async _ensureConnectionMigrations(connection) {
     if (!connection?.migrationRunner) return connection;
-    await connection.migrationRunner.runMigrations();
+
+    if (connection._migrationInFlight) {
+      await connection._migrationInFlight;
+      return connection;
+    }
+
+    const latest = await this.getLatestUserMigrationVersion();
+    if ((connection.schemaVersion ?? 0) >= latest) return connection;
+
+    connection._migrationInFlight = (async () => {
+      await connection.migrationRunner.runMigrations();
+      connection.schemaVersion = latest;
+    })();
+
+    try {
+      await connection._migrationInFlight;
+    } finally {
+      connection._migrationInFlight = null;
+    }
     return connection;
   }
 
@@ -595,9 +662,6 @@ class UserDatabaseManager {
       // Validate connection is still alive
       try {
         cached.db.prepare('SELECT 1').get();
-        // Connection is valid - refCount was incremented by get()
-        await this._ensureConnectionMigrations(cached);
-        return this._finalizeGetUserDatabase(authId, cached, pin);
       } catch (error) {
         if (isClosedDatabaseError(error)) {
           logger.warn('Cached database connection is stale, removing from pool', {
@@ -610,9 +674,14 @@ class UserDatabaseManager {
             authId,
             error: error.message,
           });
-          await this._ensureConnectionMigrations(cached);
-          return this._finalizeGetUserDatabase(authId, cached, pin);
+          // Still attempt to use the handle; migrations / queries may succeed.
         }
+      }
+
+      // pool.get already bumped refCount; only proceed if this handle is still pooled.
+      if (this.pool.cache.get(authId)?.value === cached) {
+        await this._ensureConnectionMigrations(cached);
+        return this._finalizeGetUserDatabase(authId, cached, pin);
       }
     }
 
@@ -653,6 +722,8 @@ class UserDatabaseManager {
 
   /**
    * Resolve user registry entry from cache or master DB.
+   * Never writes path-only rows into userRegistryCache — that poisons
+   * getUserRegistryInfo (missing encrypted_key) and breaks runActionBatch.
    * @param {string} authId - User authentication ID
    * @returns {Object|null} - User row with db_path or null
    * @private
@@ -662,11 +733,15 @@ class UserDatabaseManager {
     if (cached && cached.db_path) {
       return cached;
     }
+    const cachedPath = cache.getUserDbPath(authId);
+    if (cachedPath) {
+      return { db_path: cachedPath };
+    }
     const user = this.masterDbIsInstance
       ? this.masterDb.getQuery('SELECT db_path FROM user_registry WHERE auth_id = ?', [authId])
       : this.masterDb.prepare('SELECT db_path FROM user_registry WHERE auth_id = ?').get(authId);
-    if (user) {
-      cache.setUserRegistry(authId, user);
+    if (user?.db_path) {
+      cache.setUserDbPath(authId, user.db_path);
     }
     return user || null;
   }
@@ -723,7 +798,7 @@ class UserDatabaseManager {
         ? this.masterDb.getQuery('SELECT db_path FROM user_registry WHERE auth_id = ?', [authId])
         : this.masterDb.prepare('SELECT db_path FROM user_registry WHERE auth_id = ?').get(authId);
       if (user) {
-        cache.setUserRegistry(authId, user);
+        cache.setUserDbPath(authId, user.db_path);
         cache.invalidateActiveUsers();
         logger.info('Successfully created missing user registry entry', { authId, dbPath });
         return user;
@@ -760,7 +835,13 @@ class UserDatabaseManager {
     const migrationRunner = new MigrationRunner(db, 'user');
     await migrationRunner.runMigrations();
 
-    const dbConnection = { db, migrationRunner, authId, dbPath };
+    const dbConnection = {
+      db,
+      migrationRunner,
+      authId,
+      dbPath,
+      schemaVersion: await this.getLatestUserMigrationVersion(),
+    };
     this.pool.set(authId, dbConnection);
     return dbConnection;
   }
@@ -788,6 +869,11 @@ class UserDatabaseManager {
       const dbPath = user.db_path;
       return await this._openAndMigrateUserDb(authId, dbPath);
     } catch (error) {
+      // Pool exhaustion is capacity pressure, not a registry lookup failure — avoid
+      // mislabeled stack spam (often dozens of identical lines during a due-list surge).
+      if (error?.message?.includes('pool exhausted')) {
+        throw error;
+      }
       if (error.message && !error.message.includes('not found')) {
         logger.error('Failed to get user registry info', error, { authId });
       }

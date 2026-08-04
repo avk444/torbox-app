@@ -39,7 +39,7 @@ class CircuitBreaker {
   }
 
   recordSuccess() {
-    if (this.state === 'half-open' || this.failures > 0) {
+    if (this.state === 'half-open' || this.state === 'open') {
       logger.info('Circuit breaker closed', {
         name: this.name,
         previousFailures: this.failures,
@@ -82,6 +82,47 @@ const RECOVERY_PROBE_TIMEOUT_MS = Math.max(
   parseInt(process.env.TORBOX_RECOVERY_PROBE_TIMEOUT_MS || '10000', 10)
 );
 const CONNECTION_ERROR_MESSAGES = ['Network Error', 'timeout'];
+
+/**
+ * TorBox sometimes returns HTTP 500 for application/business errors (quota,
+ * plan limits, etc.). Those must not trip the global circuit breaker or be
+ * logged as "API is down".
+ */
+const APPLICATION_500_MESSAGE_PATTERNS = [
+  /active download limit/i,
+  /upgrade your plan/i,
+  /monthly limit/i,
+  /too many/i,
+  /already exists/i,
+  /duplicate/i,
+];
+
+/**
+ * Extract a human-readable TorBox error string from a response body.
+ * @param {*} data
+ * @returns {string}
+ */
+function torboxErrorText(data) {
+  if (data == null) return '';
+  if (typeof data === 'string') return data;
+  if (typeof data !== 'object') return String(data);
+  const parts = [data.detail, data.data, data.error, data.message]
+    .filter((v) => typeof v === 'string' && v.trim())
+    .map((v) => v.trim());
+  return parts.join(' ');
+}
+
+/**
+ * True when a 5xx response body looks like a TorBox application error rather
+ * than an infrastructure outage.
+ * @param {*} data
+ * @returns {boolean}
+ */
+function isTorboxApplicationServerError(data) {
+  const text = torboxErrorText(data);
+  if (!text) return false;
+  return APPLICATION_500_MESSAGE_PATTERNS.some((re) => re.test(text));
+}
 
 /** Normalize API active field to boolean (API may return true, 1, or 'true') */
 function normalizeActive(value) {
@@ -226,12 +267,22 @@ class ApiClient {
       );
     }
 
-    // Check for server errors (5xx) — all 5xx are considered connection/server errors
-    if (error.response.status >= 500) {
+    const status = error.response.status;
+    if (status < 500) {
+      return false;
+    }
+
+    // Gateway / unavailable — treat as outage regardless of body.
+    if (status === 502 || status === 503 || status === 504) {
       return true;
     }
 
-    return false;
+    // TorBox application 500s (quota/plan/etc.) are not connection failures.
+    if (isTorboxApplicationServerError(error.response.data)) {
+      return false;
+    }
+
+    return true;
   }
 
   // ============================================================================
@@ -363,11 +414,12 @@ class ApiClient {
       // Handle authentication errors
       if (this.isAuthError(error)) {
         const authError = this.createAuthError(error);
-        logger.error(`Authentication error ${operation || 'in API call'}`, authError, {
+        logger.warn(`Authentication error ${operation || 'in API call'}`, {
           endpoint,
           ...context,
           status: authError.status,
           errorCode: error.response?.data?.error,
+          message: authError.message,
         });
         throw authError;
       }
@@ -378,18 +430,29 @@ class ApiClient {
           _globalCircuitBreaker.recordFailure();
         }
         const errorDetails = this.buildErrorDetails(error, { endpoint, ...context });
+        const serverText = torboxErrorText(error.response?.data);
         const logMessage =
           connectionErrorFallback !== null
             ? `TorBox API connection error ${operation || 'in API call'} - handling gracefully`
             : `TorBox API connection error ${operation || 'in API call'}`;
 
-        logger.warn(logMessage, {
-          ...errorDetails,
-          message:
-            connectionErrorFallback !== null
-              ? 'TorBox API is down or not responding. Operation skipped.'
-              : 'TorBox API connection failed.',
-        });
+        // While the outage coordinator already paused automation, further per-call warns are noise.
+        if (torboxApiOutageCoordinator.isAutomationAllowed()) {
+          logger.warn(logMessage, {
+            ...errorDetails,
+            message:
+              serverText ||
+              (connectionErrorFallback !== null
+                ? 'TorBox API is down or not responding. Operation skipped.'
+                : 'TorBox API connection failed.'),
+          });
+        } else {
+          logger.debug(logMessage, {
+            endpoint,
+            ...context,
+            status: error.response?.status,
+          });
+        }
 
         // Return fallback value if provided (function or value)
         if (connectionErrorFallback !== null) {
@@ -401,6 +464,24 @@ class ApiClient {
         // Tag the error so callers (e.g. UserPoller.fetchTorrents) can detect it and skip
         // shadow-state processing rather than treating a connection failure as "0 torrents".
         error.isConnectionError = true;
+        throw error;
+      }
+
+      // Application-level TorBox 500s (e.g. active download limit) — warn, do not trip CB.
+      if (error.response?.status >= 500 && isTorboxApplicationServerError(error.response?.data)) {
+        error.isTorboxApplicationError = true;
+        logger.warn(`TorBox API application error ${operation || 'in API call'}`, {
+          endpoint,
+          ...context,
+          status: error.response.status,
+          errorCode: error.response?.data?.error,
+          message: torboxErrorText(error.response.data),
+        });
+        if (connectionErrorFallback !== null) {
+          return typeof connectionErrorFallback === 'function'
+            ? connectionErrorFallback(error)
+            : connectionErrorFallback;
+        }
         throw error;
       }
 

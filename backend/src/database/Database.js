@@ -1228,11 +1228,20 @@ class Database {
       const results = await Promise.allSettled(
         activeUsers.map(async (user) => {
           await syncSemaphore.acquire();
+          let pinned = false;
           try {
-            const userDb = await userDatabaseManager.getUserDatabase(user.auth_id);
+            // Pin so concurrent upload/poll closeConnection cannot close mid-query
+            // (startup + daily sync race the processor's finally closeConnection).
+            const userDb = await userDatabaseManager.getUserDatabase(user.auth_id, {
+              pin: true,
+            });
+            pinned = true;
             await this.updateUploadCounters(user.auth_id, userDb);
             return { ok: true };
           } finally {
+            if (pinned) {
+              userDatabaseManager.markInactive(user.auth_id);
+            }
             userDatabaseManager.closeConnection(user.auth_id);
             syncSemaphore.release();
           }
@@ -1326,10 +1335,13 @@ class Database {
    * @returns {Object|null} - User registry info or null if not found
    */
   getUserRegistryInfo(authId) {
-    // Check cache first
+    // Check cache first. Path-only rows (from older code / mistaken writers) lack the
+    // encrypted_key property even when the JOIN would return null — treat as miss.
     const cached = cache.getUserRegistry(authId);
     if (cached !== undefined) {
-      return cached;
+      if (cached === null || Object.prototype.hasOwnProperty.call(cached, 'encrypted_key')) {
+        return cached;
+      }
     }
 
     // Query database if not cached (only active key so encrypted_key is set only when key is usable)
@@ -1343,7 +1355,7 @@ class Database {
       [authId]
     );
 
-    // Cache the result (even if null)
+    // Cache the result (even if null); setUserRegistry also warms the db_path cache
     cache.setUserRegistry(authId, userInfo);
     return userInfo;
   }
