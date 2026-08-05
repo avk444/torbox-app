@@ -1,11 +1,10 @@
 name: Sync Upstream & Deploy to Hugging Face
-
 on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *' 
+  workflow_dispatch: # Keeps the manual trigger button active
 
 permissions:
   contents: write
@@ -13,69 +12,97 @@ permissions:
 jobs:
   sync-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout Local Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Sync with Upstream
+      - name: Fetch and Conflict-Free Merge
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-
-          cp Dockerfile /tmp/Dockerfile.custom
-          cp start.sh /tmp/start.sh.custom
-
+          
+          # 1. Back up your working custom configurations out of git's way
+          cp Dockerfile /tmp/hf.Dockerfile
+          cp start.sh /tmp/hf.start.sh
+          
+          # 2. Pull updates from the original author
           git remote add upstream https://github.com/jittarao/torbox-app.git || true
           git fetch upstream main
-          git merge upstream/main -X ours -m "Automated upstream sync" || true
-
-          cp /tmp/Dockerfile.custom Dockerfile
-          cp /tmp/start.sh.custom start.sh
-
+          
+          # 3. Merge changes, favoring our deployment architecture files automatically
+          git merge upstream/main -m "Automated sync with upstream source" -X ours || true
+          
+          # 4. Explicitly restore your verified custom files to ensure 100% stability
+          cp /tmp/hf.Dockerfile Dockerfile
+          cp /tmp/hf.start.sh start.sh
+          
+          # 5. Commit any merged files back to your repository cleanly
           git add Dockerfile start.sh
-          git commit -m "Restore custom deployment files" || true
+          git commit -m "Lock down custom Hugging Face configurations post-sync" || echo "No merge variations to lock."
 
-      - name: Push Synced Repository
+      - name: Push Updated Code Back to Your GitHub Repository
         run: |
-          git push origin main || true
+          git push origin main || echo "No new upstream commits found to sync."
 
-      - name: Setup Bun
+      - name: Setup Bun Engine
         uses: oven-sh/setup-bun@v1
         with:
           bun-version: latest
 
-      - name: Build
+      - name: Heavy Compilation on GitHub Servers
         run: |
           bun install
+          # FIX: Force-inject the missing icon library the author forgot in their package.json
           bun add lucide-react
           bun run build
 
-      - name: Prepare Hugging Face Package
+      - name: Surgical Purge of Offending Assets Only
         run: |
+          # Force Git to track the compiled production directory
           sed -i '/\.next/d' .gitignore || true
 
+          # Delete webpack cache
           rm -rf .next/cache
+
+          # Delete temporary databases
+          find . -name "*.db*" -type f -delete || true
+          find . -name "*.sqlite*" -type f -delete || true
+
+          # Remove node_modules
           rm -rf node_modules backend/node_modules
-          find . -name "*.db*" -delete || true
-          find . -name "*.sqlite*" -delete || true
 
-          # Remove any files larger than 9 MB (HF rejects large blobs)
-          find . -type f -size +9M -not -path "./.git/*" -print -delete
+          # Remove every icon HF rejects
+          find . -type f \( \
+            -name "icon-source.png" -o \
+            -name "icon.icns" -o \
+            -name "icon.png" -o \
+            -name "AppIcon-512@2x.png" -o \
+            -name "android-chrome-512x512.png" -o \
+            -name "icon-512x512.png" \
+          \) -delete
 
+          # Remove every file larger than 9 MB
+          find . -type f -size +9M -print -delete
+
+          # Verify nothing oversized remains
+          echo "Large files remaining:"
+          find . -type f -size +9M || true
+
+          # Prepare clean repo
           rm -rf .git
           git init
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git checkout -b main
           git add .
-          git commit -m "Deploy to Hugging Face"
+          git commit -m "Production update deployment package"
 
-      - name: Push to Hugging Face
+
+      - name: Push to Hugging Face Hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git push --force https://Avk44:${HF_TOKEN}@huggingface.co/spaces/Avk44/torbox-manager main:main
+          git push --force https://Avk44:$HF_TOKEN@huggingface.co/spaces/Avk44/torbox-manager main:main
 
