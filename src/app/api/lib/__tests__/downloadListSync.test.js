@@ -1,4 +1,7 @@
 import { describe, expect, test, beforeEach, afterEach, mock } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import zlib from 'zlib';
 
 const fetchFullDownloadListMock = mock(async () => ({
@@ -35,6 +38,8 @@ describe('downloadListSync', () => {
   let computeDelta;
   let getDownloadListSyncCacheEntry;
   let getDownloadListSyncRevHistoryForTests;
+  let getDownloadListSyncLiveStorageForTests;
+  let hasDownloadListSyncStateForTests;
   let handleListSyncRequest;
   let isSinglePageCatalog;
   let isMultiPageFromFullReconcile;
@@ -46,9 +51,13 @@ describe('downloadListSync', () => {
   let scheduleBackgroundReconcileIfDue;
   let setDownloadListSyncCacheForTests;
   let setDownloadListSyncCacheMetaForTests;
+  let setDownloadListSyncDiskOptionsForTests;
+  let spillIdleDownloadListSyncForTests;
   let flushMutationReconcileTimerForTests;
   let clearDownloadListSyncCacheOnlyForTests;
   let reconcileFailureBackoffMs;
+  let effectiveReconcileFailureBackoffMs;
+  let isFailedBootstrapEntry;
   let shallowFailureBackoffMs;
 
   beforeEach(async () => {
@@ -70,6 +79,8 @@ describe('downloadListSync', () => {
       computeDelta,
       getDownloadListSyncCacheEntry,
       getDownloadListSyncRevHistoryForTests,
+      getDownloadListSyncLiveStorageForTests,
+      hasDownloadListSyncStateForTests,
       handleListSyncRequest,
       isSinglePageCatalog,
       isMultiPageFromFullReconcile,
@@ -81,9 +92,13 @@ describe('downloadListSync', () => {
       scheduleBackgroundReconcileIfDue,
       setDownloadListSyncCacheForTests,
       setDownloadListSyncCacheMetaForTests,
+      setDownloadListSyncDiskOptionsForTests,
+      spillIdleDownloadListSyncForTests,
       flushMutationReconcileTimerForTests,
       clearDownloadListSyncCacheOnlyForTests,
       reconcileFailureBackoffMs,
+      effectiveReconcileFailureBackoffMs,
+      isFailedBootstrapEntry,
       shallowFailureBackoffMs,
     } = await import('../downloadListSync.js'));
 
@@ -157,6 +172,12 @@ describe('downloadListSync', () => {
       expect(reconcileFailureBackoffMs(10)).toBe(5 * 60 * 1000);
     });
 
+    test('effectiveReconcileFailureBackoffMs holds longer for plan restrictions', () => {
+      expect(effectiveReconcileFailureBackoffMs(1, 'PLAN_RESTRICTED_FEATURE')).toBe(15 * 60 * 1000);
+      expect(effectiveReconcileFailureBackoffMs(1, 'AUTH_ERROR')).toBe(15_000);
+      expect(effectiveReconcileFailureBackoffMs(2, 'AUTH_ERROR')).toBe(5 * 60 * 1000);
+    });
+
     test('shallowFailureBackoffMs grows exponentially with cap', () => {
       expect(shallowFailureBackoffMs(0)).toBe(0);
       expect(shallowFailureBackoffMs(1)).toBe(5_000);
@@ -166,6 +187,38 @@ describe('downloadListSync', () => {
   });
 
   describe('handleListSyncRequest', () => {
+    test('cold-miss TorBox failure negative-caches and skips TorBox during backoff', async () => {
+      fetchFullDownloadListMock.mockImplementation(async () => {
+        throw new Error('PLAN_RESTRICTED_FEATURE');
+      });
+
+      await expect(
+        handleListSyncRequest({
+          apiKey: API_KEY,
+          type: TYPE,
+          rev: null,
+          bypassCache: false,
+        })
+      ).rejects.toThrow('PLAN_RESTRICTED_FEATURE');
+
+      const entry = getDownloadListSyncCacheEntry(API_KEY, TYPE);
+      expect(entry).not.toBeNull();
+      expect(isFailedBootstrapEntry(entry)).toBe(true);
+      expect(entry.reconcileFailureCount).toBe(1);
+      expect(fetchFullDownloadListMock).toHaveBeenCalledTimes(1);
+
+      fetchFullDownloadListMock.mockClear();
+      await expect(
+        handleListSyncRequest({
+          apiKey: API_KEY,
+          type: TYPE,
+          rev: null,
+          bypassCache: false,
+        })
+      ).rejects.toThrow('PLAN_RESTRICTED_FEATURE');
+      expect(fetchFullDownloadListMock).not.toHaveBeenCalled();
+    });
+
     test('full initial sync caches more than 1000 items', async () => {
       const fullData = Array.from({ length: 1500 }, (_, index) =>
         item(index + 1, `2020-01-${String((index % 28) + 1).padStart(2, '0')}`)
@@ -317,6 +370,68 @@ describe('downloadListSync', () => {
       expect(result.headers['x-sync-mode']).toBe('delta');
       const body = parseCompressedBody(result.compressedBody);
       expect(body.data.map((row) => row.id)).toEqual([2]);
+    });
+
+    test('live cache entry keeps gzip only (no durable uncompressed data)', () => {
+      setDownloadListSyncCacheForTests(API_KEY, TYPE, [item(1, '2020-01-02')]);
+      const storage = getDownloadListSyncLiveStorageForTests(API_KEY, TYPE);
+      expect(storage.inMemory).toBe(true);
+      expect(storage.hasCompressedBody).toBe(true);
+      expect(storage.hasUncompressedData).toBe(false);
+      expect(getDownloadListSyncCacheEntry(API_KEY, TYPE)?.data.map((row) => row.id)).toEqual([1]);
+    });
+
+    test('getEntry TTL clears syncState so rev history is not orphaned', async () => {
+      const rev = setDownloadListSyncCacheForTests(API_KEY, TYPE, [item(1, '2020-01-02')]);
+      fetchShallowDownloadListMock.mockResolvedValueOnce(
+        shallowResult([item(2, '2020-01-03'), item(1, '2020-01-02')])
+      );
+      await runShallowRefresh(API_KEY, TYPE, { blocking: true });
+      expect(getDownloadListSyncRevHistoryForTests(API_KEY, TYPE).length).toBeGreaterThan(0);
+      expect(hasDownloadListSyncStateForTests(API_KEY, TYPE)).toBe(true);
+
+      // Force TTL expiry without going through the 5-minute sweep.
+      setDownloadListSyncCacheMetaForTests(API_KEY, TYPE, {
+        lastAccess: Date.now() - 31 * 60 * 1000,
+      });
+      expect(getDownloadListSyncCacheEntry(API_KEY, TYPE)).toBeNull();
+      expect(hasDownloadListSyncStateForTests(API_KEY, TYPE)).toBe(false);
+      expect(getDownloadListSyncRevHistoryForTests(API_KEY, TYPE)).toEqual([]);
+      expect(rev).toBeGreaterThanOrEqual(1);
+    });
+
+    test('idle disk spill frees memory and next request hydrates without full reconcile', async () => {
+      const spillDir = fs.mkdtempSync(path.join(os.tmpdir(), 'download-list-sync-'));
+      setDownloadListSyncDiskOptionsForTests({ dir: spillDir, spillMs: 1 });
+
+      const rev = setDownloadListSyncCacheForTests(API_KEY, TYPE, [item(1, '2020-01-02')]);
+      setDownloadListSyncCacheMetaForTests(API_KEY, TYPE, {
+        lastAccess: Date.now() - 1000,
+        lastShallowPollAt: Date.now(),
+      });
+
+      spillIdleDownloadListSyncForTests();
+
+      const spilled = getDownloadListSyncLiveStorageForTests(API_KEY, TYPE);
+      expect(spilled.inMemory).toBe(false);
+      expect(spilled.onDisk).toBe(true);
+      expect(hasDownloadListSyncStateForTests(API_KEY, TYPE)).toBe(false);
+
+      fetchShallowDownloadListMock.mockClear();
+      fetchFullDownloadListMock.mockClear();
+
+      const result = await handleListSyncRequest({
+        apiKey: API_KEY,
+        type: TYPE,
+        rev,
+        bypassCache: false,
+      });
+
+      expect(result.status).toBe(304);
+      expect(result.headers['x-list-rev']).toBe(String(rev));
+      expect(fetchFullDownloadListMock).not.toHaveBeenCalled();
+      expect(getDownloadListSyncLiveStorageForTests(API_KEY, TYPE).inMemory).toBe(true);
+      expect(getDownloadListSyncLiveStorageForTests(API_KEY, TYPE).onDisk).toBe(false);
     });
 
     test('stale rev multiple behind returns accumulated delta', async () => {
@@ -783,9 +898,21 @@ describe('downloadListSync', () => {
           rev: null,
           bypassCache: false,
         })
-      ).rejects.toThrow();
+      ).rejects.toThrow('TorBox unavailable');
 
-      expect(getDownloadListSyncCacheEntry(API_KEY, TYPE)).toBeNull();
+      const entry = getDownloadListSyncCacheEntry(API_KEY, TYPE);
+      expect(entry).not.toBeNull();
+      expect(isFailedBootstrapEntry(entry)).toBe(true);
+      expect(entry.data).toEqual([]);
+      // Negative cache must not be served as a successful list response.
+      await expect(
+        handleListSyncRequest({
+          apiKey: API_KEY,
+          type: TYPE,
+          rev: null,
+          bypassCache: false,
+        })
+      ).rejects.toThrow('TorBox unavailable');
     });
 
     test('full reconcile skips publish when trusted mutation occurs during reconcile', async () => {
