@@ -46,6 +46,8 @@ class DatabasePool {
       options.idleTimeoutMs ??
       parseInt(process.env.DB_POOL_IDLE_TIMEOUT_MS || String(defaultIdleTimeoutMs), 10);
     this.recentAccessWindowMs = 30 * 1000; // 30 seconds - don't evict connections accessed in this window
+    // When true, 80%/90% capacity warns are suppressed (bulk startup sweeps churn the pool).
+    this.suppressCapacityWarnings = false;
   }
 
   /**
@@ -355,6 +357,9 @@ class DatabasePool {
    * @private
    */
   _checkCapacityWarnings(previousSize) {
+    if (this.suppressCapacityWarnings) {
+      return;
+    }
     const currentSize = this.cache.size;
     const usagePercent = currentSize / this.maxSize;
     const previousPercent = previousSize / this.maxSize;
@@ -1219,11 +1224,41 @@ class UserDatabaseManager {
   }
 
   /**
+   * Durable pin summary for memory / pool diagnostics (correlates RSS with stuck pins).
+   * @returns {{ pinnedUsers: number, totalPins: number }}
+   */
+  getPinStats() {
+    let pinnedUsers = 0;
+    let totalPins = 0;
+    for (const n of this.pinCounts.values()) {
+      if (n > 0) {
+        pinnedUsers += 1;
+        totalPins += n;
+      }
+    }
+    return { pinnedUsers, totalPins };
+  }
+
+  /**
    * Get pool statistics with detailed metrics
    * @returns {Object} - Detailed pool statistics
    */
   getPoolStats() {
-    return this.pool.getStats();
+    const stats = this.pool.getStats();
+    const pins = this.getPinStats();
+    return {
+      ...stats,
+      pinnedUsers: pins.pinnedUsers,
+      totalPins: pins.totalPins,
+    };
+  }
+
+  /**
+   * Suppress (or restore) pool capacity warnings during known bulk DB churn (startup sweeps).
+   * @param {boolean} suppressed
+   */
+  setCapacityWarningsSuppressed(suppressed) {
+    this.pool.suppressCapacityWarnings = Boolean(suppressed);
   }
 
   /**
