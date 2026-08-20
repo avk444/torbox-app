@@ -9,21 +9,18 @@ import { sanitizeError } from '@/utils/sanitizeError';
 const DELETE_CONFIG = {
   torrents: {
     cacheType: 'torrents',
-    mylistPath: '/api/torrents/mylist',
     queuedType: 'torrent',
     controlPath: '/api/torrents/controltorrent',
     idField: 'torrent_id',
   },
   usenet: {
     cacheType: 'usenet',
-    mylistPath: '/api/usenet/mylist',
     queuedType: 'usenet',
     controlPath: '/api/usenet/controlusenetdownload',
     idField: 'usenet_id',
   },
   webdl: {
     cacheType: 'webdl',
-    mylistPath: '/api/webdl/mylist',
     queuedType: 'webdl',
     controlPath: '/api/webdl/controlwebdownload',
     idField: 'webdl_id',
@@ -38,42 +35,35 @@ function buildTorboxHeaders(apiKey) {
 }
 
 /**
+ * TorBox control APIs expect numeric ids. JSON/client paths sometimes pass strings.
+ * @param {string|number} id
+ * @returns {string|number}
+ */
+export function coerceTorboxDownloadId(id) {
+  if (typeof id === 'number' && Number.isFinite(id)) return id;
+  if (id === '' || id == null) return id;
+  const parsed = Number(id);
+  return Number.isFinite(parsed) ? parsed : id;
+}
+
+/**
  * Delete one download via TorBox control API.
  * @param {object} options
  * @param {string} options.apiKey
  * @param {string|number} options.id
  * @param {'torrents'|'usenet'|'webdl'} [options.assetType='torrents']
- * @param {boolean} [options.skipProtectionCheck=false]
+ * @param {boolean} [options.queued=false] Client-known queue vs mylist routing (avoids getqueued).
  * @returns {Promise<Response>}
  */
-export async function deleteDownloadItem({
-  apiKey,
-  id,
-  assetType = 'torrents',
-  skipProtectionCheck = false,
-}) {
+export async function deleteDownloadItem({ apiKey, id, assetType = 'torrents', queued = false }) {
   const config = DELETE_CONFIG[assetType] || DELETE_CONFIG.torrents;
+  const downloadId = coerceTorboxDownloadId(id);
 
-  if (!skipProtectionCheck) {
-    const blocked = await guardDestructiveOrRespond(apiKey, [id], 'delete');
-    if (blocked) return blocked;
-  }
+  const blocked = await guardDestructiveOrRespond(apiKey, [downloadId], 'delete');
+  if (blocked) return blocked;
 
   const headers = buildTorboxHeaders(apiKey);
-
-  const [, queuedResponse] = await Promise.all([
-    torboxFetch(`${API_BASE}/${API_VERSION}${config.mylistPath}?id=${id}`, {
-      cache: 'no-store',
-      headers,
-    }),
-    torboxFetch(`${API_BASE}/${API_VERSION}/api/queued/getqueued?type=${config.queuedType}`, {
-      cache: 'no-store',
-      headers,
-    }),
-  ]);
-
-  const queuedData = await safeJsonParse(queuedResponse);
-  const isQueued = queuedData.data?.some((item) => item.id === id);
+  const isQueued = queued === true;
 
   const endpoint = isQueued
     ? `${API_BASE}/${API_VERSION}/api/queued/controlqueued`
@@ -81,12 +71,12 @@ export async function deleteDownloadItem({
 
   const body = isQueued
     ? JSON.stringify({
-        queued_id: id,
+        queued_id: downloadId,
         operation: 'delete',
         type: config.queuedType,
       })
     : JSON.stringify({
-        [config.idField]: id,
+        [config.idField]: downloadId,
         operation: 'delete',
       });
 
@@ -102,7 +92,7 @@ export async function deleteDownloadItem({
 
   const data = await safeJsonParse(response);
 
-  if (!response.ok) {
+  if (!response.ok || data.success === false) {
     if (assetType === 'torrents') {
       logRouteError('[torrents DELETE] Upstream error', {
         error: data.error || `API responded with status: ${response.status}`,
@@ -115,11 +105,11 @@ export async function deleteDownloadItem({
         error: data.error || `API responded with status: ${response.status}`,
         detail: data.detail,
       },
-      { status: response.status }
+      { status: response.ok ? 200 : response.status }
     );
   }
 
-  await patchCacheRemoveIds(apiKey, config.cacheType, [id]);
+  await patchCacheRemoveIds(apiKey, config.cacheType, [downloadId]);
 
   return Response.json(data);
 }
