@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { Check, Edit, Hash, MagnifyingGlass, Plus, Trash, X } from '@/components/icons';
 import { useTags } from '@/components/shared/hooks/useTags';
@@ -217,7 +217,11 @@ export default function TagManager({ isOpen, onClose, apiKey }) {
     requestAnimationFrame(() => createInputRef.current?.focus());
   }, [isOpen, resetState]);
 
-  const onCloseEvent = useEffectEvent(onClose);
+  // Keep the latest onClose in a ref (works on any React version)
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
 
   useEffect(() => {
     if (!isOpen) return undefined;
@@ -233,7 +237,7 @@ export default function TagManager({ isOpen, onClose, apiKey }) {
         setPendingDelete(null);
         return;
       }
-      onCloseEvent();
+      onCloseRef.current();
     };
 
     document.addEventListener('keydown', onKeyDown);
