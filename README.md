@@ -1,3 +1,13 @@
+---
+title: Torbox Manager
+emoji: 📈
+colorFrom: yellow
+colorTo: indigo
+sdk: docker
+pinned: false
+license: agpl-3.0
+---
+
 # TorBox Manager
 
 A modern, power-user focused alternative to the default TorBox UI. Built with Next.js for speed and efficiency.
